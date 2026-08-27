@@ -685,7 +685,10 @@ class SyncEngine {
 
     const position = Number(data.position) || 0;
     const paused = !!data.paused;
-    const rate = Number(data.rate) || 1.0;
+    // 0 means "the sender has no opinion about speed". PotPlayer cannot read its
+    // own rate and omits the field; defaulting to 1.0 here made every PotPlayer
+    // packet silently reset the room to normal speed.
+    const rate = Number(data.rate) > 0 ? Number(data.rate) : 0;
 
     const c = this.clock[sid];
     let elapsed = 0;
@@ -699,7 +702,8 @@ class SyncEngine {
       if (elapsed > 5) elapsed = 5;
     }
 
-    const target = paused ? position : position + elapsed * rate;
+    // Extrapolate at the sender's speed, assuming 1.0x when it did not say.
+    const target = paused ? position : position + elapsed * (rate || 1.0);
 
     if (this.onRemoteState) {
       this.onRemoteState({

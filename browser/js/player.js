@@ -795,7 +795,9 @@ class VideoPlayer {
     // Hold the echo mute open for the whole apply, including the seek settle.
     this.sync.mute(heartbeat ? 700 : 400);
 
-    if (st.rate && Math.abs(this.video.playbackRate - st.rate) > 0.01) {
+    // A rate of 0 means the sender could not report one (PotPlayer), so we keep
+    // whatever speed this player is already on.
+    if (st.rate > 0 && Math.abs(this.video.playbackRate - st.rate) > 0.01) {
       this.video.playbackRate = st.rate;
       this._updateSpeedUI();
     }

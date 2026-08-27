@@ -55,6 +55,20 @@ POLL_S = 0.25
 TOL_EXPLICIT = 0.80
 TOL_HEARTBEAT = 1.50
 
+# How close the playhead has to get to a requested seek before we call it landed.
+SEEK_SETTLE_MS = 700.0
+# A change this large with the player paused can only be a user scrub. While
+# playing we need a looser bar, because the poll interval itself jitters.
+JUMP_PAUSED_MS = 400.0
+JUMP_PLAYING_MS = 1200.0
+
+# No Win32 call may block the caller longer than this. PotPlayer stops pumping
+# messages while it decodes a heavy seek, and an unbounded SendMessageW there
+# would stall the asyncio loop along with every send queued on it.
+IPC_TIMEOUT_MS = 400
+# A cached snapshot older than this is treated as unknown rather than reused.
+SNAPSHOT_MAX_AGE_S = 3.0
+
 # Optional websockets package for room-based sync with mpvEx and Web
 try:
     import websockets
@@ -70,7 +84,24 @@ POT_SET_CURRENT_TIME = 0x5005  # Set position (lParam = ms)
 POT_GET_PLAY_STATUS = 0x5006   # 0: Stopped, 1: Paused, 2: Running
 POT_SET_PLAY_STATUS = 0x5007   # 0: Toggle, 1: Pause, 2: Play
 
+SMTO_ABORTIFHUNG = 0x0002
+
 user32 = ctypes.windll.user32
+
+# Declared explicitly: with the default ctypes signatures a 64-bit HWND is
+# truncated to a C int, and lParam is passed at the wrong width.
+user32.FindWindowW.restype = ctypes.c_void_p
+user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+user32.SendMessageTimeoutW.restype = ctypes.c_long
+user32.SendMessageTimeoutW.argtypes = [
+    ctypes.c_void_p,                  # hWnd
+    ctypes.c_uint,                    # Msg
+    ctypes.c_void_p,                  # wParam
+    ctypes.c_void_p,                  # lParam
+    ctypes.c_uint,                    # fuFlags
+    ctypes.c_uint,                    # uTimeout
+    ctypes.POINTER(ctypes.c_void_p),  # lpdwResult
+]
 
 
 def new_sid():
@@ -92,6 +123,10 @@ class PotPlayerController:
         # Timestamp deadline, not a boolean: nested applies can only extend it.
         self._mute_until = 0.0
         self._lock = threading.Lock()
+        # Last reading taken by the poll thread, so callers on the asyncio loop
+        # can read playback state without making a blocking Win32 call.
+        self._cache = None
+        self._cache_lock = threading.Lock()
 
     # -- echo suppression ---------------------------------------------------
 
@@ -135,49 +170,75 @@ class PotPlayerController:
         self.hwnd = hwnd
         return hwnd
 
+    def _ipc(self, wparam, lparam=0):
+        """One bounded PotPlayer message. Returns None if it did not get through.
+
+        Never uses plain SendMessageW: that blocks for as long as PotPlayer's UI
+        thread is busy, which is exactly what happens during a seek.
+        """
+        hwnd = self.find_window()
+        if not hwnd:
+            return None
+        out = ctypes.c_void_p(0)
+        ok = user32.SendMessageTimeoutW(hwnd, WM_USER, wparam, lparam,
+                                       SMTO_ABORTIFHUNG, IPC_TIMEOUT_MS,
+                                       ctypes.byref(out))
+        if not ok:
+            return None
+        return int(out.value or 0)
+
     # -- reads --------------------------------------------------------------
 
-    def get_status(self):
-        """0: Stopped, 1: Paused, 2: Running, -1: Not Running"""
-        if not self.find_window():
-            return -1
-        return user32.SendMessageW(self.hwnd, WM_USER, POT_GET_PLAY_STATUS, 0)
-
-    def get_current_time_ms(self):
-        if not self.find_window():
-            return 0
-        return user32.SendMessageW(self.hwnd, WM_USER, POT_GET_CURRENT_TIME, 0)
-
-    def get_total_time_ms(self):
-        if not self.find_window():
-            return 0
-        return user32.SendMessageW(self.hwnd, WM_USER, POT_GET_TOTAL_TIME, 0)
-
     def snapshot(self):
-        """(status, position_ms, duration_ms) in one pass."""
-        if not self.find_window():
+        """(status, position_ms, duration_ms) in one pass. Blocking — poll thread only.
+
+        This is the only read path. There deliberately are no single-value
+        accessors: every caller outside the poll thread must use
+        `cached_snapshot()` so it cannot block the asyncio loop.
+        """
+        status = self._ipc(POT_GET_PLAY_STATUS)
+        if status is None:
+            self._store_snapshot(-1, 0, 0)
             return -1, 0, 0
-        status = user32.SendMessageW(self.hwnd, WM_USER, POT_GET_PLAY_STATUS, 0)
-        pos = user32.SendMessageW(self.hwnd, WM_USER, POT_GET_CURRENT_TIME, 0)
-        total = user32.SendMessageW(self.hwnd, WM_USER, POT_GET_TOTAL_TIME, 0)
+        pos = self._ipc(POT_GET_CURRENT_TIME) or 0
+        total = self._ipc(POT_GET_TOTAL_TIME) or 0
+        self._store_snapshot(status, pos, total)
+        return status, pos, total
+
+    def _store_snapshot(self, status, pos, total):
+        with self._cache_lock:
+            self._cache = (status, pos, total, time.time())
+
+    def cached_snapshot(self):
+        """The poll thread's last reading, with the playhead advanced to now.
+
+        Used by the asyncio loop so that applying a remote state never makes a
+        blocking Win32 call. Returns (-1, 0, 0) when there is no fresh reading.
+        """
+        with self._cache_lock:
+            cached = self._cache
+        if not cached:
+            return -1, 0, 0
+        status, pos, total, at = cached
+        age = time.time() - at
+        if age > SNAPSHOT_MAX_AGE_S:
+            return -1, 0, 0
+        if status == 2:
+            pos = int(pos + age * 1000.0)
+            if total > 0:
+                pos = min(pos, total)
         return status, pos, total
 
     # -- writes -------------------------------------------------------------
 
     def set_time_ms(self, time_ms):
-        if not self.find_window():
-            return
-        user32.SendMessageW(self.hwnd, WM_USER, POT_SET_CURRENT_TIME, int(max(0, time_ms)))
+        self._ipc(POT_SET_CURRENT_TIME, int(max(0, time_ms)))
 
     def play(self):
-        if not self.find_window():
-            return
-        user32.SendMessageW(self.hwnd, WM_USER, POT_SET_PLAY_STATUS, 2)
+        self._ipc(POT_SET_PLAY_STATUS, 2)
 
     def pause(self):
-        if not self.find_window():
-            return
-        user32.SendMessageW(self.hwnd, WM_USER, POT_SET_PLAY_STATUS, 1)
+        self._ipc(POT_SET_PLAY_STATUS, 1)
 
     def open_media(self, path_or_url):
         """Launch or load media file/URL inside PotPlayer"""
@@ -249,6 +310,10 @@ class UltimatePotPlayerApp:
         self.last_time_ms = 0
         self.last_poll_at = time.time()
         self.is_monitoring = True
+        # Set while a seek we requested is still landing; see _poll_once.
+        self.seek_settle = None
+        # PotPlayer cannot change speed, so we mirror the room's rate instead.
+        self.room_rate = 1.0
 
         self._last_hello = 0.0
         self._last_heartbeat = 0.0
@@ -571,18 +636,24 @@ class UltimatePotPlayerApp:
             print(f"[WS] Send failed: {e}")
 
     def _local_state(self):
-        """Absolute playback state, or None when PotPlayer has nothing loaded."""
-        status, pos_ms, total_ms = self.pot.snapshot()
+        """Absolute playback state, or None when PotPlayer has nothing to assert."""
+        status, pos_ms, total_ms = self.pot.cached_snapshot()
         if status < 0 or total_ms <= 0:
+            return None
+        # Stopped is not "paused at 0". PotPlayer zeroes the playhead when the
+        # file ends or the user hits stop, and a state carrying position 0 would
+        # rewind the entire room to the beginning. A stopped player has no
+        # playback state, so it stays quiet until something is playing again.
+        if status == 0:
             return None
         return {
             "position": pos_ms / 1000.0,
-            # Anything that is not actively running counts as paused, so a
-            # stopped player does not read as "playing at 0".
             "paused": status != 2,
-            # PotPlayer's documented message set has no playback-rate accessor,
-            # so we always report 1.0 and ignore remote rate changes.
-            "rate": 1.0,
+            # `rate` is deliberately ABSENT. PotPlayer's documented message set
+            # has no playback-rate accessor, so any value we put here would be a
+            # guess — and a guess of 1.0 reset the whole room's speed on every
+            # packet we sent. Omitting the key means "no opinion"; receivers
+            # leave their own speed alone. See PROTOCOL.md §3.
             "duration": total_ms / 1000.0,
         }
 
@@ -590,6 +661,10 @@ class UltimatePotPlayerApp:
         if not self.is_connected:
             return
         if cause != "heartbeat" and self.pot.is_muted:
+            return
+        # Even a leader must not assert authority while its own seek is still
+        # landing — the playhead is transient until the settle window closes.
+        if cause == "heartbeat" and self.seek_settle is not None:
             return
         state = override or self._local_state()
         if not state:
@@ -727,22 +802,41 @@ class UltimatePotPlayerApp:
         if heartbeat and self.pot.is_muted:
             return
 
-        status, local_ms, total_ms = self.pot.snapshot()
+        # Cached, so applying a remote state never blocks on PotPlayer's UI thread.
+        status, local_ms, total_ms = self.pot.cached_snapshot()
         if status < 0 or total_ms <= 0:
             return
 
         position = float(msg.get("position", 0.0))
         paused = bool(msg.get("paused", True))
+
+        # We can neither read nor set PotPlayer's speed, so we never publish a
+        # rate and never try to follow one. All we can usefully do is tell the
+        # user once, because at anything other than 1.0x they will drift.
+        rate = float(msg.get("rate", 0.0) or 0.0)
+        if rate > 0 and abs(rate - self.room_rate) > 0.01:
+            self.room_rate = rate
+            if abs(rate - 1.0) > 0.01:
+                self.root.after(0, self._log_chat, "System",
+                                f"⚠️ Room switched to {rate:g}x. PotPlayer cannot be "
+                                f"driven at other speeds — set {rate:g}x in PotPlayer "
+                                f"yourself (Playback ▸ Speed) or ask the room for 1.0x.")
+
         est = self.clocks.get(sid)
         offset = est.offset_ms if est else 0.0
         sent_at = int(msg.get("sent_at", 0))
 
         elapsed = 0.0
         if sent_at > 0:
-            elapsed = ((now_ms() - offset) - sent_at) / 1000.0
+            # `offset` is senderClock - myClock, so my clock reads `now + offset`
+            # on the sender's timescale. Subtracting it here would double the
+            # skew instead of cancelling it.
+            elapsed = ((now_ms() + offset) - sent_at) / 1000.0
             elapsed = max(0.0, min(5.0, elapsed))
 
-        target = position if paused else position + elapsed
+        # Extrapolate at the sender's speed when it told us one; a sender that
+        # cannot report its speed is assumed to be running at 1.0x.
+        target = position if paused else position + elapsed * (rate if rate > 0 else 1.0)
         target = max(0.0, min(target, total_ms / 1000.0))
         target_ms = int(target * 1000)
 
@@ -753,7 +847,11 @@ class UltimatePotPlayerApp:
 
         if needs_seek:
             self.pot.set_time_ms(target_ms)
-            self.pot.mute_settled(MUTE_SEEK_SETTLED)
+            # The mute is NOT shortened here: nothing has confirmed the seek
+            # landed yet. The poller shortens it once the playhead arrives, and
+            # swallows the keyframe snap so we never rebroadcast it as a seek.
+            self.seek_settle = {"target_ms": target_ms, "at": time.time(),
+                                "deadline": time.time() + MUTE_SEEK}
 
         # Absolute pause state, never a toggle.
         locally_paused = status != 2
@@ -826,6 +924,7 @@ class UltimatePotPlayerApp:
                 text="⚠️ PotPlayer not found. Open Daum PotPlayer on PC!", foreground="#eab308"))
             self.last_status = -1
             self.last_poll_at = now
+            self.seek_settle = None
             return
 
         status_names = {0: "Stopped", 1: "Paused", 2: "Playing"}
@@ -834,10 +933,34 @@ class UltimatePotPlayerApp:
         self.root.after(0, lambda s=info_str: self.lbl_pot_status.config(
             text=s, foreground="#38bdf8" if status == 2 else "#94a3b8"))
 
+        # A seek we asked for is still landing. PotPlayer snaps to a keyframe, so
+        # the playhead can arrive seconds away from the target — broadcasting that
+        # as a fresh seek would drag the whole room onto our keyframe.
+        settle = self.seek_settle
+        if settle is not None:
+            age = now - settle["at"]
+            expected = settle["target_ms"] + (age * 1000.0 if status == 2 else 0.0)
+            arrived = abs(curr_ms - expected) <= SEEK_SETTLE_MS
+            if arrived or now >= settle["deadline"]:
+                self.seek_settle = None
+                self.pot.mute_settled(MUTE_SEEK_SETTLED)
+            # Only the POSITION baseline is refreshed. `last_status` is left alone
+            # on purpose — see the muted branch below.
+            self.last_time_ms = curr_ms
+            self.last_poll_at = now
+            return
+
         if self.pot.is_muted:
-            # We are mid-apply; keep the baseline fresh so the settle does not
-            # register as a user seek.
-            self.last_status = status
+            # We are mid-apply, so the position is transient: keep that baseline
+            # fresh or the settle reads as a user seek.
+            #
+            # `last_status` is deliberately NOT refreshed. `_apply_remote_state`
+            # already set it to the play/pause state it commanded, so it is a
+            # correct baseline. Overwriting it here with whatever PotPlayer
+            # happens to report *destroys* a pause the user pressed during the
+            # mute window: the next poll would see status == last_status and
+            # conclude nothing had changed, so the pause reached nobody. Leaving
+            # it means the transition is simply reported once the mute lifts.
             self.last_time_ms = curr_ms
             self.last_poll_at = now
             return
@@ -853,8 +976,15 @@ class UltimatePotPlayerApp:
             return
 
         # A jump away from where natural playback would have landed is a seek.
+        # Paused, there is no natural motion to allow for, so a much smaller
+        # change is already unambiguous — without this, scrubbing a paused
+        # PotPlayer by under a second never reached anyone.
+        # `prev_status < 0` above is the only "no baseline yet" guard we need;
+        # gating on `prev_time > 0` as well would swallow a seek made from the
+        # very start of a freshly opened file.
         expected = prev_time + (dt_ms if prev_status == 2 else 0.0)
-        if prev_time > 0 and abs(curr_ms - expected) > 1200:
+        jump_tol = JUMP_PLAYING_MS if prev_status == 2 else JUMP_PAUSED_MS
+        if abs(curr_ms - expected) > jump_tol:
             self._send_state("seek")
             return
 

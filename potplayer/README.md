@@ -23,10 +23,13 @@
 5. **Integrated Live Chat**:
    - Send and receive chat messages across all platforms while watching.
 
-> **Known limitation:** PotPlayer's documented remote-control message set has no
-> playback-rate accessor, so this client always reports and holds 1.0× and ignores
-> remote speed changes. Everything else — position, play/pause, seeks, chat — syncs
-> fully. Protocol details: [../PROTOCOL.md](../PROTOCOL.md).
+> **Known limitation — playback speed.** PotPlayer's documented remote-control message set
+> has no playback-rate accessor, so this client can neither read nor change PotPlayer's
+> speed. It therefore **never sends a speed** and **never applies one**: it just tells you
+> in the chat pane if the room moves off 1.0×, so you can set the same speed in PotPlayer
+> yourself (Playback ▸ Speed). Keep the room at 1.0× if you want it aligned without
+> thinking about it. Everything else — position, play/pause, seeks, chat — syncs fully.
+> Protocol details: [../PROTOCOL.md](../PROTOCOL.md).
 
 ---
 

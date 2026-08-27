@@ -103,9 +103,16 @@ the accept path.
 |---|---|
 | `position` | Playhead in seconds at the instant `sent_at` was stamped. |
 | `paused` | `true` = paused, `false` = playing. Absolute, not a toggle. |
-| `rate` | Playback speed. `1.0` default. |
+| `rate` | Playback speed. **Optional.** Omitted, or `<= 0`, means *"I cannot report my speed"* — receivers must then leave their own speed untouched and extrapolate at 1.0×. It does **not** mean 1.0×. |
 | `cause` | `play` \| `pause` \| `seek` \| `rate` \| `start` \| `heartbeat` \| `resync`. Advisory: it drives the on-screen toast and the drift threshold, never the applied value. |
 | `duration` | Media length, for the "different file?" warning. Optional. |
+
+> **`rate` is the one field a sender may legitimately not know.** PotPlayer has no
+> playback-rate accessor at all, so it omits the key entirely. Every receiver reads a
+> missing or non-positive `rate` as "no opinion" and skips the set-speed step. Defaulting
+> it to 1.0 on the receiving side — which the web, Android and PotPlayer clients all used
+> to do — meant a single PotPlayer peer reset the whole room's speed to normal on every
+> packet it sent, several times a second.
 
 `cause` values and who sends them:
 
@@ -167,6 +174,13 @@ offset = t1 - (t0 + t3) / 2          // remoteClock - myClock
 Both are smoothed with an EMA (α = 0.3) and the sample is discarded if
 `rtt > 2000 ms`. Sent every 5 s per peer (three fast probes at 700 ms on first contact).
 
+`offset` is **senderClock − myClock**, so a sender's timestamp converts to my clock as
+`sent_at − offset`, and my clock converts to theirs as `myNow + offset`. Getting that sign
+backwards does not cancel the skew, it *doubles* it — two clients that were 4 s apart
+ended up a fixed 5 s apart in playback (the `elapsed` clamp below is all that kept it
+from being 8 s). Both the Android and PotPlayer clients shipped that inversion; the
+formula in §4 is the correct one.
+
 ### `file_info`
 
 ```json
@@ -189,7 +203,7 @@ With no offset sample yet, `elapsed` falls back to `rtt/2` if known, else `0`.
 Then, with the local echo suppressed (§6):
 
 ```
-if rate      != mine     -> set rate
+if rate      != mine     -> set rate      (skipped entirely when rate is absent / <= 0)
 if |target - mine| > TOL -> seek to target
 if paused                -> pause
 else                     -> play
@@ -211,11 +225,56 @@ Those four gates are what stop a heartbeat from fighting a user who is mid-seek.
 |---|---|---|---|
 | Web browser | 0.30 s | 0.70 s | Reference implementation. |
 | Android (mpvEx) | 0.30 s | 0.70 s | Same as web. |
-| Daum PotPlayer | 0.80 s | 1.50 s | PotPlayer is driven over `SendMessage` and seeks by keyframe; it thrashes at 0.30 s. |
+| Daum PotPlayer | 0.80 s | 1.50 s | PotPlayer is driven over `SendMessage` and seeks by keyframe; it thrashes at 0.30 s. Never sends `rate`. |
 
 **PotPlayer cannot set or read playback rate** — the documented remote-control message
-set has no accessor for it. That client always sends `rate: 1.0` and ignores the `rate`
-step when applying. A room containing a PotPlayer client should stay at 1.0×.
+set has no accessor for it. That client therefore **omits `rate` from every packet it
+sends** and **skips the rate step on every packet it receives**. It holds whatever speed
+the user set in PotPlayer, and tells the user in the chat pane once, when it sees the room
+move off 1.0×, that they need to change PotPlayer's speed by hand. A room containing a
+PotPlayer client should still stay at 1.0× if you want it aligned.
+
+Earlier revisions had it assert `rate: 1.0`, then mirror back the last rate it had heard.
+Both were wrong: the first reset the room's speed several times a second, and the second
+made PotPlayer parrot a speed it was not actually playing at, so its `position` and the
+speed it advertised described two different playbacks. Omission is the only honest answer.
+
+### PotPlayer: keyframe snap
+
+`POT_SET_CURRENT_TIME` seeks to the nearest keyframe, so the playhead can arrive
+seconds away from the requested target. The poller must not read that arrival as a user
+scrub — rebroadcasting it drags the entire room onto PotPlayer's keyframe. So while a
+requested seek is landing, the client holds a **settle window**: it re-baselines its
+change detector on every poll and broadcasts nothing. The window closes as soon as the
+playhead reaches the target (within 700 ms of where natural playback predicts) or after
+`MUTE_SEEK` (2.5 s), whichever comes first.
+
+Its local seek-detection threshold also depends on the transport state: **1200 ms while
+playing** (the poll interval jitters, so natural motion has to be allowed for) but only
+**400 ms while paused**, where any change at all is unambiguously a user scrub. With a
+single 1200 ms threshold, scrubbing a paused PotPlayer by under a second reached nobody.
+The detector's only "no baseline yet" gate is the status being unknown — it must not also
+require a non-zero previous position, or a seek made from the very start of a freshly
+opened file is silently swallowed.
+
+### PotPlayer: stopped is not paused-at-zero
+
+`POT_GET_PLAY_STATUS` returns `0` when playback is stopped — end of file, or the user hit
+stop — and PotPlayer zeroes the playhead at the same time. That must never be published:
+`{position: 0, paused: true}` rewinds the whole room to the beginning. A stopped PotPlayer
+has no playback state, so `_local_state()` returns `None` and the client emits nothing at
+all (not even the pause) until something is playing again. If it happened to be the
+leader, its heartbeats simply stop — no correction is much better than a wrong one.
+
+### PotPlayer: never block the socket
+
+Every PotPlayer read/write is a `SendMessageTimeoutW` capped at 400 ms with
+`SMTO_ABORTIFHUNG`, never a bare `SendMessageW`. PotPlayer stops pumping messages while
+it decodes a heavy seek, and a blocking call there stalls the asyncio loop — which is
+also the socket reader and the outbound send queue, so sync freezes in both directions
+at exactly the worst moment. The poll thread additionally caches each reading, and
+everything running on the event loop reads that cache (with the playhead extrapolated to
+now) instead of touching Win32 at all.
 
 ---
 
@@ -278,8 +337,17 @@ call sites use `pauseLocalOnly()` which pauses mpv with broadcasting suppressed.
 PotPlayer uses the same deadline (`PotPlayerController.mute` / `mute_settled`) with
 slightly larger budgets — 600 ms simple, 2500 ms seek shortened to 450 ms once settled,
 900 ms heartbeat — because its 250 ms poll loop needs more than one tick to see the
-result of a `SendMessage` land. Its poller also re-baselines position and status while
-muted, so the settle after a seek is never mistaken for a user scrub.
+result of a `SendMessage` land.
+
+While muted, its poller re-baselines the **position** only, so the settle after a seek is
+never mistaken for a user scrub. It deliberately does **not** re-baseline the play/pause
+status: `_apply_remote_state` already set that baseline to the state it commanded, and
+overwriting it with whatever PotPlayer currently reports *destroys* a pause the user
+pressed inside the mute window — the next poll sees `status == last_status`, concludes
+nothing changed, and the pause reaches nobody. Since a peer heartbeat mutes for 900 ms
+every 3 s, roughly a third of all user pauses vanished this way, which is exactly the
+"sometimes pausing PotPlayer doesn't pause the others" symptom. Leaving the status
+baseline alone means the transition is simply reported as soon as the mute lifts.
 
 ---
 
