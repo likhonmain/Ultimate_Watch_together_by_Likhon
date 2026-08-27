@@ -44,10 +44,18 @@ async def handle_client(websocket):
 
             msg_type = msg.get("type", "")
 
+            # Ping / Keepalive
+            if msg_type == "ping":
+                try:
+                    await websocket.send(json.dumps({"type": "pong", "timestamp": msg.get("timestamp")}))
+                except Exception:
+                    pass
+                continue
+
             # 1. Room Join
-            if msg_type == "join_room":
-                room_id = str(msg.get("room_id", "default")).strip()
-                username = msg.get("username", client_id)
+            if msg_type in ("join_room", "join"):
+                room_id = str(msg.get("room_id") or msg.get("room") or "default").strip()
+                username = msg.get("username") or msg.get("user") or client_id
                 platform = msg.get("platform", "generic")
 
                 # Remove from old room if switching
@@ -71,6 +79,7 @@ async def handle_client(websocket):
                 await websocket.send(json.dumps({
                     "type": "room_joined",
                     "room_id": room_id,
+                    "room": room_id,
                     "client_id": client_id,
                     "peer_count": len(ROOMS[room_id])
                 }))
@@ -80,6 +89,7 @@ async def handle_client(websocket):
                     "type": "peer_joined",
                     "client_id": client_id,
                     "username": username,
+                    "user": username,
                     "platform": platform,
                     "peer_count": len(ROOMS[room_id])
                 })
@@ -90,10 +100,19 @@ async def handle_client(websocket):
                         except Exception:
                             pass
 
-            # 2. Sync Actions (play, pause, seek, rate, chat, file_info)
-            elif msg_type in ("play", "pause", "seek", "rate", "chat", "file_info", "heartbeat"):
+            # 2. Sync Actions (play, pause, seek, rate, chat, file_info, action)
+            elif msg_type in ("play", "pause", "seek", "rate", "chat", "file_info", "heartbeat", "action"):
+                # If current_room wasn't set by join, check message payload
                 if not current_room or current_room not in ROOMS:
-                    continue
+                    req_room = str(msg.get("room") or msg.get("room_id") or "").strip()
+                    if req_room:
+                        current_room = req_room
+                        if current_room not in ROOMS:
+                            ROOMS[current_room] = set()
+                        ROOMS[current_room].add(websocket)
+                        CLIENT_ROOM[websocket] = current_room
+                    else:
+                        continue
 
                 # Attach sender metadata
                 sender_info = CLIENT_INFO.get(websocket, {})

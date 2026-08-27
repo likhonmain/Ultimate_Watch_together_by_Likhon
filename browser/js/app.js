@@ -458,7 +458,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const mpStartDesc = document.getElementById('mp-start-desc');
 
   function updateStartButtonState() {
-    const isPeerConnected = sync.connections && sync.connections.length > 0;
+    const isPeerConnected = (sync.connections && sync.connections.length > 0) || (sync.cloudPeerCount > 1);
     const isReady = mediaLoaded && isPeerConnected;
 
     startButtons.forEach(btn => {
@@ -497,12 +497,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast('Please select a movie file first.', false);
       return;
     }
-    if (!sync.connections || sync.connections.length === 0) {
+    const isPeerConnected = (sync.connections && sync.connections.length > 0) || (sync.cloudPeerCount > 1);
+    if (!isPeerConnected) {
       showToast('Waiting for friend to join your room first.', false);
       return;
     }
 
-    // Send WebRTC sync action to peer
+    // Send sync action to peer (broadcasts to WebRTC and Cloud Relay)
     sync.sendAction('start_watching', 0);
 
     // Play locally from beginning

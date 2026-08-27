@@ -9,6 +9,7 @@ import sys
 import os
 import time
 import json
+import random
 import socket
 import asyncio
 import threading
@@ -17,6 +18,9 @@ import ctypes
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+
+# Default Cloud WebSocket Relay URL
+DEFAULT_RELAY_URL = "wss://138-68-159-46.sslip.io/ws"
 
 # Optional websockets package for room-based sync with mpvEx and Web
 try:
@@ -131,6 +135,7 @@ class UltimatePotPlayerApp:
 
         self.pot = PotPlayerController()
         self.is_connected = False
+        self.is_host = False
         self.ws = None
         self.loop = None
         self.room_code = "582"
@@ -168,7 +173,7 @@ class UltimatePotPlayerApp:
         ttk.Label(hdr, text="🎬 Ultimate Watch Together", style="Header.TLabel").pack(side=tk.LEFT)
         ttk.Label(hdr, text="Daum PotPlayer Sync", foreground="#818cf8", font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=8)
 
-        # Card 1: Room Connection
+        # Card 1: Room Connection (No Relay Server IP entry - hardcoded cloud relay)
         c1 = ttk.Frame(main, style="Card.TFrame", padding="12")
         c1.pack(fill=tk.X, pady=6)
 
@@ -178,12 +183,17 @@ class UltimatePotPlayerApp:
         self.entry_room = tk.Entry(c1_top, bg="#0f172a", fg="#38bdf8", insertbackground="#ffffff",
                                    font=("Consolas", 12, "bold"), width=8, justify="center")
         self.entry_room.insert(0, "582")
-        self.entry_room.pack(side=tk.LEFT, padx=10)
+        self.entry_room.pack(side=tk.LEFT, padx=(8, 10))
 
-        self.btn_connect = tk.Button(c1_top, text="Connect to Room", bg="#6366f1", fg="#ffffff",
-                                     font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=3,
-                                     command=self.toggle_connection)
-        self.btn_connect.pack(side=tk.LEFT, padx=6)
+        self.btn_create_room = tk.Button(c1_top, text="➕ Create Room", bg="#10b981", fg="#ffffff",
+                                         font=("Segoe UI", 9, "bold"), relief="flat", padx=10, pady=3,
+                                         command=self.create_room)
+        self.btn_create_room.pack(side=tk.LEFT, padx=4)
+
+        self.btn_join_room = tk.Button(c1_top, text="Join Room", bg="#6366f1", fg="#ffffff",
+                                       font=("Segoe UI", 9, "bold"), relief="flat", padx=12, pady=3,
+                                       command=self.join_room)
+        self.btn_join_room.pack(side=tk.LEFT, padx=4)
 
         self.lbl_net_status = ttk.Label(c1, text="● Not Connected", foreground="#ef4444", style="Status.TLabel")
         self.lbl_net_status.pack(anchor="w", pady=(8, 0))
@@ -259,81 +269,120 @@ class UltimatePotPlayerApp:
                 "platform": "PotPlayer (Windows)"
             })
 
-    def toggle_connection(self):
-        if not self.is_connected:
-            room = self.entry_room.get().strip()
-            if not room:
-                messagebox.showwarning("Room Required", "Please enter a 3-digit room code.")
-                return
-            self.room_code = room
-            self._connect_to_relay()
-        else:
+    def create_room(self):
+        if self.is_connected:
+            return
+        code = str(random.randint(100, 999))
+        self.entry_room.delete(0, tk.END)
+        self.entry_room.insert(0, code)
+        self.room_code = code
+        self.is_host = True
+        self._connect_to_relay()
+
+    def join_room(self):
+        if self.is_connected:
             self._disconnect_from_relay()
+            return
+        room = self.entry_room.get().strip()
+        if not room:
+            messagebox.showwarning("Room Required", "Please enter a 3-digit room code.")
+            return
+        self.room_code = room
+        self.is_host = False
+        self._connect_to_relay()
 
     def _connect_to_relay(self):
-        server_url = "ws://127.0.0.1:8765" # Default local relay or can point to cloud VPS
-        self.btn_connect.config(text="Connecting...", state=tk.DISABLED)
+        if not HAS_WEBSOCKETS:
+            messagebox.showerror("Missing Package", "websockets package is required.\nRun: pip install websockets")
+            return
+        self.btn_create_room.config(state=tk.DISABLED)
+        self.btn_join_room.config(text="Connecting...", state=tk.DISABLED)
+        self.lbl_net_status.config(text=f"● Connecting to Cloud Relay [{self.room_code}]...", foreground="#eab308")
 
         def ws_thread():
-            asyncio.run(self._ws_worker(server_url))
+            asyncio.run(self._ws_worker(DEFAULT_RELAY_URL))
 
         threading.Thread(target=ws_thread, daemon=True).start()
 
     async def _ws_worker(self, url):
         try:
-            async with websockets.connect(url) as ws:
+            # ping_interval=15 sends WebSocket ping frame every 15s to keep NAT/4G/5G alive
+            async with websockets.connect(url, ping_interval=15, ping_timeout=20) as ws:
                 self.ws = ws
                 self.is_connected = True
+                self.loop = asyncio.get_running_loop()
                 self.root.after(0, self._on_connected)
 
-                # Send join room
-                await ws.send(json.dumps({
-                    "type": "join_room",
+                # Register on Cloud Relay (supports standard and legacy fields)
+                join_pkt = {
+                    "type": "join",
+                    "room": self.room_code,
+                    "user": self.username,
                     "room_id": self.room_code,
                     "username": self.username,
+                    "role": "host" if self.is_host else "guest",
                     "platform": "PotPlayer (Windows)"
-                }))
+                }
+                await ws.send(json.dumps(join_pkt))
 
-                async for msg_str in ws:
-                    try:
-                        data = json.loads(msg_str)
-                        self.root.after(0, self._handle_remote_sync, data)
-                    except Exception as e:
-                        print(f"Error handling message: {e}")
+                # Background ping/pong keepalive task every 15s to maintain 4G/5G connections
+                async def ping_keepalive_loop():
+                    while self.is_connected:
+                        await asyncio.sleep(15)
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "ping",
+                                "timestamp": int(time.time() * 1000)
+                            }))
+                        except Exception:
+                            break
+
+                keepalive_task = asyncio.create_task(ping_keepalive_loop())
+
+                try:
+                    async for msg_str in ws:
+                        try:
+                            data = json.loads(msg_str)
+                            self.root.after(0, self._handle_remote_sync, data)
+                        except Exception as e:
+                            print(f"Error handling message: {e}")
+                finally:
+                    keepalive_task.cancel()
 
         except Exception as e:
             print(f"[WS] Connection error: {e}")
         finally:
             self.is_connected = False
             self.ws = None
+            self.loop = None
             self.root.after(0, self._on_disconnected)
 
     def _on_connected(self):
-        self.lbl_net_status.config(text=f"● Connected to Room [{self.room_code}]", foreground="#22c55e")
-        self.btn_connect.config(text="Disconnect", bg="#ef4444", state=tk.NORMAL)
-        self._log_chat("System", f"Joined room {self.room_code}. In sync with mpvEx & Web!")
+        role_label = "Host" if self.is_host else "Guest"
+        self.lbl_net_status.config(text=f"● Connected to Room [{self.room_code}] as {role_label}", foreground="#22c55e")
+        self.btn_create_room.config(state=tk.DISABLED)
+        self.btn_join_room.config(text="Disconnect", bg="#ef4444", state=tk.NORMAL)
+        self._log_chat("System", f"Joined room {self.room_code} as {role_label}. In sync with mpvEx & Web!")
 
     def _on_disconnected(self):
         self.lbl_net_status.config(text="● Disconnected", foreground="#ef4444")
-        self.btn_connect.config(text="Connect to Room", bg="#6366f1", state=tk.NORMAL)
+        self.btn_create_room.config(state=tk.NORMAL, text="➕ Create Room", bg="#10b981")
+        self.btn_join_room.config(text="Join Room", bg="#6366f1", state=tk.NORMAL)
         self._log_chat("System", "Disconnected from room.")
 
     def _disconnect_from_relay(self):
-        if self.ws:
-            # closing will break ws_worker loop
+        if self.ws and self.loop:
             try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self.ws.close())
+                asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
             except Exception:
                 pass
 
     def _broadcast(self, msg_dict):
-        if self.is_connected and self.ws:
+        if self.is_connected and self.ws and self.loop:
             try:
-                # Thread-safe send
                 asyncio.run_coroutine_threadsafe(
                     self.ws.send(json.dumps(msg_dict)),
-                    self.ws.loop
+                    self.loop
                 )
             except Exception:
                 pass
@@ -341,8 +390,32 @@ class UltimatePotPlayerApp:
     def _handle_remote_sync(self, msg):
         msg_type = msg.get("type", "")
 
+        # Action from Cloud Relay / Web Client
+        if msg_type == "action" and isinstance(msg.get("action"), dict):
+            act = msg["action"]
+            act_type = act.get("type", "")
+            act_time_s = float(act.get("time", 0))
+            act_time_ms = int(act_time_s * 1000)
+
+            if act_type == "play":
+                local_time_ms = self.pot.get_current_time_ms()
+                if abs(local_time_ms - act_time_ms) > 1500:
+                    self.pot.set_time_ms(act_time_ms)
+                self.pot.play()
+                self._log_chat("Sync", f"Remote PLAY at {self._format_ms(act_time_ms)}")
+            elif act_type == "pause":
+                self.pot.pause()
+                local_time_ms = self.pot.get_current_time_ms()
+                if abs(local_time_ms - act_time_ms) > 1500:
+                    self.pot.set_time_ms(act_time_ms)
+                self._log_chat("Sync", f"Remote PAUSE at {self._format_ms(act_time_ms)}")
+            elif act_type == "seek":
+                self.pot.set_time_ms(act_time_ms)
+                self._log_chat("Sync", f"Remote SEEK to {self._format_ms(act_time_ms)}")
+            return
+
         if msg_type == "play":
-            remote_time_s = msg.get("time", 0)
+            remote_time_s = float(msg.get("time", 0))
             remote_time_ms = int(remote_time_s * 1000)
             local_time_ms = self.pot.get_current_time_ms()
             if abs(local_time_ms - remote_time_ms) > 1500:
@@ -351,7 +424,7 @@ class UltimatePotPlayerApp:
             self._log_chat("Sync", f"Remote PLAY at {self._format_ms(remote_time_ms)}")
 
         elif msg_type == "pause":
-            remote_time_s = msg.get("time", 0)
+            remote_time_s = float(msg.get("time", 0))
             remote_time_ms = int(remote_time_s * 1000)
             self.pot.pause()
             local_time_ms = self.pot.get_current_time_ms()
@@ -360,20 +433,33 @@ class UltimatePotPlayerApp:
             self._log_chat("Sync", f"Remote PAUSE at {self._format_ms(remote_time_ms)}")
 
         elif msg_type == "seek":
-            remote_time_s = msg.get("time", 0)
+            remote_time_s = float(msg.get("time", 0))
             remote_time_ms = int(remote_time_s * 1000)
             self.pot.set_time_ms(remote_time_ms)
             self._log_chat("Sync", f"Remote SEEK to {self._format_ms(remote_time_ms)}")
 
         elif msg_type == "chat":
-            sender = msg.get("sender_name", "Friend")
-            text = msg.get("text", "")
-            self._log_chat(sender, text)
+            chat_data = msg.get("chat")
+            if isinstance(chat_data, dict):
+                sender = chat_data.get("sender") or msg.get("sender_name", "Friend")
+                text = chat_data.get("text", "")
+            else:
+                sender = msg.get("sender_name") or msg.get("sender", "Friend")
+                text = msg.get("text", "")
+            if text:
+                self._log_chat(sender, text)
 
-        elif msg_type == "peer_joined":
-            pname = msg.get("username", "Friend")
+        elif msg_type in ("peer_joined", "room_joined"):
+            pname = msg.get("username") or msg.get("user", "Friend")
             plat = msg.get("platform", "")
-            self._log_chat("System", f"🎉 {pname} joined the room ({plat})")
+            plat_str = f" ({plat})" if plat else ""
+            if msg_type == "room_joined":
+                self._log_chat("System", f"Room {self.room_code} ready on Cloud Relay!")
+            else:
+                self._log_chat("System", f"🎉 {pname} joined the room{plat_str}")
+
+        elif msg_type == "peer_left":
+            self._log_chat("System", "⚠️ A friend left the room.")
 
     def _start_potplayer_monitor(self):
         """Background poller to detect local user actions in PotPlayer"""
@@ -405,9 +491,13 @@ class UltimatePotPlayerApp:
                 expected_time = self.last_known_time_ms + (300 if status == 2 else 0)
                 if abs(curr_ms - expected_time) > 1500 and total_ms > 0 and self.last_known_time_ms > 0:
                     print(f"[Local Action] Seek detected: {curr_ms}ms")
+                    sec = curr_ms / 1000.0
                     self._broadcast({
-                        "type": "seek",
-                        "time": curr_ms / 1000.0,
+                        "type": "action",
+                        "room": self.room_code,
+                        "action": {"type": "seek", "time": sec},
+                        "time": sec,
+                        "room_id": self.room_code,
                         "timestamp": int(time.time() * 1000)
                     })
 
@@ -415,17 +505,25 @@ class UltimatePotPlayerApp:
                 if status != self.last_known_status and self.last_known_status != -1:
                     if status == 2: # Went to Playing
                         print(f"[Local Action] Play detected at {curr_ms}ms")
+                        sec = curr_ms / 1000.0
                         self._broadcast({
-                            "type": "play",
-                            "time": curr_ms / 1000.0,
+                            "type": "action",
+                            "room": self.room_code,
+                            "action": {"type": "play", "time": sec},
+                            "time": sec,
+                            "room_id": self.room_code,
                             "rate": 1.0,
                             "timestamp": int(time.time() * 1000)
                         })
                     elif status == 1: # Went to Paused
                         print(f"[Local Action] Pause detected at {curr_ms}ms")
+                        sec = curr_ms / 1000.0
                         self._broadcast({
-                            "type": "pause",
-                            "time": curr_ms / 1000.0,
+                            "type": "action",
+                            "room": self.room_code,
+                            "action": {"type": "pause", "time": sec},
+                            "time": sec,
+                            "room_id": self.room_code,
                             "timestamp": int(time.time() * 1000)
                         })
 
@@ -442,7 +540,14 @@ class UltimatePotPlayerApp:
         self._log_chat(self.username + " (You)", text)
         self._broadcast({
             "type": "chat",
+            "room": self.room_code,
+            "chat": {
+                "sender": self.username,
+                "text": text,
+                "time": int(time.time() * 1000)
+            },
             "text": text,
+            "sender_name": self.username,
             "timestamp": int(time.time() * 1000)
         })
 

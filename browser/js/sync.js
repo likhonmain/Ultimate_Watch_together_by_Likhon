@@ -24,6 +24,14 @@ class SyncEngine {
     this.localUsername = localStorage.getItem('wt_username') || localStorage.getItem('wt_nickname') || ('User_' + Math.floor(100 + Math.random() * 900));
     this.peersMap = {}; // peerId -> { isSelf, peerId, username, role, isHost, status, joinedAt }
 
+    // Cloud WebSocket Relay Configuration & State
+    this.cloudWs = null;
+    this.cloudWsUrl = 'wss://138-68-159-46.sslip.io/ws';
+    this.cloudWsConnected = false;
+    this.cloudWsPingTimer = null;
+    this.cloudWsReconnectTimer = null;
+    this.cloudPeerCount = 0;
+
     // Callbacks
     this.onStatusChange = null;
     this.onPeerConnected = null;
@@ -53,6 +61,16 @@ class SyncEngine {
       username: this.localUsername,
       sender: this.localPeerId
     });
+
+    if (this.cloudWs && this.cloudWs.readyState === WebSocket.OPEN && this.roomId) {
+      try {
+        this.cloudWs.send(JSON.stringify({
+          type: 'join',
+          room: String(this.roomId),
+          user: this.localUsername
+        }));
+      } catch (e) {}
+    }
 
     if (this.onPeerListChanged) {
       this.onPeerListChanged(this.getPeerList());
@@ -196,6 +214,9 @@ class SyncEngine {
     this.isHost = true;
     this.roomId = randomCode;
 
+    // Connect to Cloud WebSocket Relay alongside PeerJS
+    this._connectCloudRelay(randomCode);
+
     await this.init(randomCode);
     this._startHeartbeat();
     return randomCode;
@@ -205,10 +226,13 @@ class SyncEngine {
    * Client joins an existing room with connection timeout & retry
    */
   async joinRoom(targetRoomId) {
-    targetRoomId = targetRoomId.trim();
+    targetRoomId = String(targetRoomId).trim();
     this.isHost = false;
     this.roomId = targetRoomId;
     this.retryAttempts = 0;
+
+    // Connect to Cloud WebSocket Relay alongside PeerJS
+    this._connectCloudRelay(targetRoomId);
 
     if (!this.peer || this.peer.destroyed || !this.peerReady) {
       await this.init();
@@ -216,6 +240,231 @@ class SyncEngine {
 
     this._connectToHostWithRetry(targetRoomId);
     return targetRoomId;
+  }
+
+  /**
+   * Connect to the Cloud WebSocket Relay (wss://138-68-159-46.sslip.io/ws)
+   * in addition to / alongside PeerJS WebRTC.
+   */
+  _connectCloudRelay(roomId) {
+    if (!roomId) return;
+    const cleanRoom = String(roomId).trim();
+
+    if (this.cloudWs) {
+      try {
+        this.cloudWs.onopen = null;
+        this.cloudWs.onmessage = null;
+        this.cloudWs.onerror = null;
+        this.cloudWs.onclose = null;
+        this.cloudWs.close();
+      } catch (e) {}
+      this.cloudWs = null;
+    }
+    clearInterval(this.cloudWsPingTimer);
+    clearTimeout(this.cloudWsReconnectTimer);
+
+    try {
+      console.log(`[Sync] Connecting to Cloud WebSocket Relay: ${this.cloudWsUrl} (Room: ${cleanRoom})`);
+      this.cloudWs = new WebSocket(this.cloudWsUrl);
+
+      this.cloudWs.onopen = () => {
+        console.log('[Sync] Cloud WebSocket Relay connected successfully!');
+        this.cloudWsConnected = true;
+
+        // When a 3-digit room is created or joined, register on the cloud relay:
+        // {"type": "join", "room": roomId, "user": username}
+        const joinPacket = {
+          type: 'join',
+          room: cleanRoom,
+          user: this.getUsername()
+        };
+        this.cloudWs.send(JSON.stringify(joinPacket));
+
+        // Ensure ping/pong keepalive is sent every 15s to maintain 4G/5G connections
+        this.cloudWsPingTimer = setInterval(() => {
+          if (this.cloudWs && this.cloudWs.readyState === WebSocket.OPEN) {
+            try {
+              this.cloudWs.send(JSON.stringify({
+                type: 'ping',
+                timestamp: Date.now()
+              }));
+            } catch (e) {}
+          }
+        }, 15000);
+      };
+
+      this.cloudWs.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          this._handleCloudRelayMessage(data);
+        } catch (err) {
+          console.warn('[Sync] Could not parse cloud relay message:', err);
+        }
+      };
+
+      this.cloudWs.onerror = (err) => {
+        console.warn('[Sync] Cloud WebSocket Relay error:', err);
+      };
+
+      this.cloudWs.onclose = () => {
+        console.log('[Sync] Cloud WebSocket Relay disconnected.');
+        this.cloudWsConnected = false;
+        clearInterval(this.cloudWsPingTimer);
+
+        // Auto-reconnect after 3s if user is still in room
+        if (this.roomId) {
+          this.cloudWsReconnectTimer = setTimeout(() => {
+            if (this.roomId) {
+              console.log('[Sync] Reconnecting to Cloud WebSocket Relay...');
+              this._connectCloudRelay(this.roomId);
+            }
+          }, 3000);
+        }
+      };
+    } catch (err) {
+      console.error('[Sync] Failed to initialize Cloud WebSocket Relay:', err);
+    }
+  }
+
+  /**
+   * Process incoming messages from Cloud WebSocket Relay
+   */
+  _handleCloudRelayMessage(data) {
+    if (!data || !data.type) return;
+
+    // 1. Action packet from Cloud Relay:
+    // {"type": "action", "room": roomId, "action": {"type": "play"/"pause"/"seek", "time": currentTime}}
+    if (data.type === 'action' && data.action) {
+      const act = data.action;
+      const actType = act.type;
+      const actTime = typeof act.time === 'number' ? act.time : parseFloat(act.time || 0);
+
+      this.isRemoteUpdate = true;
+
+      // Apply action to local video player
+      if (window.player && window.player.video) {
+        const v = window.player.video;
+        if (actType === 'play') {
+          v.currentTime = actTime;
+          if (act.rate) v.playbackRate = act.rate;
+          v.play().catch(e => console.warn('[Player] Remote play blocked:', e));
+          if (window.player._showGestureAnimation) window.player._showGestureAnimation('Play (Synced)');
+          if (window.player._hideCenterPlayCard) window.player._hideCenterPlayCard();
+        } else if (actType === 'pause') {
+          v.currentTime = actTime;
+          v.pause();
+          if (window.player._showGestureAnimation) window.player._showGestureAnimation('Pause (Synced)');
+          if (window.player._showCenterPlayCard) window.player._showCenterPlayCard();
+        } else if (actType === 'seek') {
+          v.currentTime = actTime;
+          if (window.player._showGestureAnimation && window.player._formatTime) {
+            window.player._showGestureAnimation(`Seek: ${window.player._formatTime(actTime)}`);
+          }
+        } else if (actType === 'start_watching') {
+          v.currentTime = actTime || 0;
+          v.play().catch(e => console.warn('[Player] Autoplay blocked:', e));
+          if (window.player._showGestureAnimation) window.player._showGestureAnimation('🎬 Started Watching Together!');
+          if (window.player._hideCenterPlayCard) window.player._hideCenterPlayCard();
+          if (window.showToast) window.showToast('🎬 Friend started watching together!', true, 4000);
+        }
+      }
+
+      // Trigger onActionReceived callback
+      if (this.onActionReceived) {
+        this.onActionReceived({
+          type: actType,
+          time: actTime,
+          rate: act.rate || 1.0,
+          timestamp: Date.now()
+        });
+      }
+
+      setTimeout(() => { this.isRemoteUpdate = false; }, 350);
+      return;
+    }
+
+    // 2. Direct play/pause/seek from mpvEx / legacy clients
+    if (data.type === 'play' || data.type === 'pause' || data.type === 'seek') {
+      const actTime = typeof data.time === 'number' ? data.time : parseFloat(data.time || 0);
+      this.isRemoteUpdate = true;
+
+      if (window.player && window.player.video) {
+        const v = window.player.video;
+        if (data.type === 'play') {
+          v.currentTime = actTime;
+          if (data.rate) v.playbackRate = data.rate;
+          v.play().catch(() => {});
+        } else if (data.type === 'pause') {
+          v.currentTime = actTime;
+          v.pause();
+        } else if (data.type === 'seek') {
+          v.currentTime = actTime;
+        }
+      }
+
+      if (this.onActionReceived) {
+        this.onActionReceived(data);
+      }
+
+      setTimeout(() => { this.isRemoteUpdate = false; }, 350);
+      return;
+    }
+
+    // 3. Chat message from Cloud Relay:
+    // {"type": "chat", "room": roomId, "chat": {"sender": username, "text": text, "time": Date.now()}}
+    if (data.type === 'chat') {
+      let sender = 'Friend';
+      let text = '';
+      let timestamp = Date.now();
+
+      if (data.chat && typeof data.chat === 'object') {
+        sender = data.chat.sender || data.sender_name || 'Friend';
+        text = data.chat.text || '';
+        timestamp = data.chat.time || Date.now();
+      } else {
+        sender = data.sender_name || data.sender || 'Friend';
+        text = data.text || '';
+        timestamp = data.timestamp || Date.now();
+      }
+
+      // Do not duplicate own messages
+      if (sender === this.getUsername()) return;
+
+      if (text && this.onChatReceived) {
+        this.onChatReceived({
+          text: text,
+          sender: sender,
+          timestamp: timestamp
+        });
+      }
+      return;
+    }
+
+    // 4. Room / Peer presence updates from Cloud Relay
+    if (data.type === 'room_joined' || data.type === 'peer_joined' || data.type === 'peer_left') {
+      if (typeof data.peer_count === 'number') {
+        this.cloudPeerCount = data.peer_count;
+        this._notifyPeerCount();
+      }
+
+      if (data.type === 'peer_joined') {
+        const name = data.username || data.user || 'Friend';
+        if (name !== this.getUsername()) {
+          this._updateStatus('connected', 'Connected with friend!');
+          if (this.onChatReceived) {
+            this.onChatReceived({
+              text: `🎉 ${name} joined the room`,
+              sender: 'System',
+              timestamp: Date.now()
+            });
+          }
+        }
+      } else if (data.type === 'peer_left') {
+        if (this.connections.length === 0 && this.cloudPeerCount <= 1) {
+          this._updateStatus('ready', this.isHost ? 'Friend disconnected. Waiting...' : 'Connection closed.');
+        }
+      }
+    }
   }
 
   _connectToHostWithRetry(targetRoomId) {
@@ -431,16 +680,70 @@ class SyncEngine {
     }
   }
 
+  /**
+   * Send playback action to Cloud WebSocket Relay:
+   * {"type": "action", "room": roomId, "action": {"type": "play"/"pause"/"seek", "time": currentTime}}
+   */
+  sendCloudAction(actionType, currentTime) {
+    if (!this.cloudWs || this.cloudWs.readyState !== WebSocket.OPEN || !this.roomId) return;
+    if (this.isRemoteUpdate) return;
+
+    try {
+      const cur = typeof currentTime === 'number' ? currentTime : parseFloat(currentTime || 0);
+      const pkt = {
+        type: 'action',
+        room: String(this.roomId),
+        action: {
+          type: actionType,
+          time: cur
+        }
+      };
+      this.cloudWs.send(JSON.stringify(pkt));
+    } catch (e) {
+      console.warn('[Sync] Send cloud action error:', e);
+    }
+  }
+
+  /**
+   * Broadcast chat message to Cloud WebSocket Relay:
+   * {"type": "chat", "room": roomId, "chat": {"sender": username, "text": text, "time": Date.now()}}
+   */
+  sendCloudChat(text, sender) {
+    if (!this.cloudWs || this.cloudWs.readyState !== WebSocket.OPEN || !this.roomId) return;
+    try {
+      const pkt = {
+        type: 'chat',
+        room: String(this.roomId),
+        chat: {
+          sender: sender || this.getUsername(),
+          text: text,
+          time: Date.now()
+        }
+      };
+      this.cloudWs.send(JSON.stringify(pkt));
+    } catch (e) {
+      console.warn('[Sync] Send cloud chat error:', e);
+    }
+  }
+
   sendPlay(currentTime, playbackRate) {
     this.broadcast({ type: 'play', time: currentTime, rate: playbackRate, timestamp: Date.now() });
+    this.sendCloudAction('play', currentTime);
   }
 
   sendPause(currentTime) {
     this.broadcast({ type: 'pause', time: currentTime, timestamp: Date.now() });
+    this.sendCloudAction('pause', currentTime);
   }
 
   sendSeek(currentTime) {
     this.broadcast({ type: 'seek', time: currentTime, timestamp: Date.now() });
+    this.sendCloudAction('seek', currentTime);
+  }
+
+  sendAction(actionType, time = 0) {
+    this.broadcast({ type: actionType, time: time, timestamp: Date.now() });
+    this.sendCloudAction(actionType, time);
   }
 
   sendRate(rate) {
@@ -448,8 +751,10 @@ class SyncEngine {
   }
 
   sendChat(text, sender) {
-    const msg = { type: 'chat', text: text, sender: sender, timestamp: Date.now() };
+    const currentName = sender || this.getUsername();
+    const msg = { type: 'chat', text: text, sender: currentName, timestamp: Date.now() };
     this.broadcast(msg);
+    this.sendCloudChat(text, currentName);
     return msg;
   }
 
@@ -552,8 +857,12 @@ class SyncEngine {
   }
 
   _notifyPeerCount() {
+    const totalCount = Math.max(
+      this.connections.length,
+      Math.max(0, (this.cloudPeerCount || 1) - 1)
+    );
     if (this.onPeerCountChanged) {
-      this.onPeerCountChanged(this.connections.length);
+      this.onPeerCountChanged(totalCount);
     }
   }
 
@@ -562,6 +871,17 @@ class SyncEngine {
     if (this.pingTimer) clearInterval(this.pingTimer);
     if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
+    if (this.cloudWsPingTimer) clearInterval(this.cloudWsPingTimer);
+    clearTimeout(this.cloudWsReconnectTimer);
+    if (this.cloudWs) {
+      try {
+        this.cloudWs.onclose = null;
+        this.cloudWs.onerror = null;
+        this.cloudWs.onmessage = null;
+        this.cloudWs.close();
+      } catch (e) {}
+      this.cloudWs = null;
+    }
     if (this.wakeLock) {
       this.wakeLock.release().catch(() => {});
       this.wakeLock = null;
