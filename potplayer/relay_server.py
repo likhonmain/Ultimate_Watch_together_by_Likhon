@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Ultimate Watch Together — Multi-Platform Relay Server
-Bridges Daum PotPlayer (Windows), mpvEx (Android), and Web Browsers (HTML5)
-using standard WebSocket room-based messaging.
+Ultimate Watch Together — Multi-Platform Relay Server (protocol v2)
+
+Bridges Daum PotPlayer (Windows), mpvEx (Android), and Web Browsers (HTML5) using
+room-based WebSocket messaging. See PROTOCOL.md.
+
+The relay is deliberately dumb: it holds room membership and fans messages out. It
+keeps **no playback state** and never interprets a `state` packet, so clients can
+evolve the protocol without touching the server.
+
+Every v2 client also works against the older allowlist-based relay, so deploying this
+is optional.
 """
 
 import asyncio
@@ -26,8 +34,43 @@ except ImportError:
 ROOMS = {}
 # client -> room_id
 CLIENT_ROOM = {}
-# client -> client_id
+# client -> {id, username, platform, sid}
 CLIENT_INFO = {}
+
+# Frames the relay handles itself; everything else is forwarded verbatim. A blocklist
+# rather than an allowlist, so a new `kind` never needs a server change to work.
+LOCAL_TYPES = frozenset({"ping", "pong", "join_room", "join", "room_joined",
+                         "peer_joined", "peer_left"})
+
+
+def peer_list(room_id, exclude=None):
+    """Public description of everyone in a room, for `room_joined`."""
+    out = []
+    for peer in ROOMS.get(room_id, ()):
+        if peer is exclude:
+            continue
+        info = CLIENT_INFO.get(peer)
+        if not info:
+            continue
+        out.append({
+            "client_id": info["id"],
+            "sid": info.get("sid"),
+            "username": info.get("username"),
+            "platform": info.get("platform", "unknown"),
+        })
+    return out
+
+
+async def fan_out(room_id, payload, exclude=None):
+    """Send to everyone in the room except `exclude`. Dead sockets are ignored."""
+    for peer in list(ROOMS.get(room_id, ())):
+        if peer is exclude:
+            continue
+        try:
+            await peer.send(payload)
+        except Exception:
+            pass
+
 
 async def handle_client(websocket):
     client_id = f"client_{id(websocket) % 10000}"
@@ -44,7 +87,8 @@ async def handle_client(websocket):
 
             msg_type = msg.get("type", "")
 
-            # Ping / Keepalive
+            # Ping / keepalive. Clients send this every 15 s so mobile carrier NAT
+            # tables do not expire during a long pause.
             if msg_type == "ping":
                 try:
                     await websocket.send(json.dumps({"type": "pong", "timestamp": msg.get("timestamp")}))
@@ -52,7 +96,10 @@ async def handle_client(websocket):
                     pass
                 continue
 
-            # 1. Room Join
+            if msg_type == "pong":
+                continue
+
+            # 1. Room join
             if msg_type in ("join_room", "join"):
                 room_id = str(msg.get("room_id") or msg.get("room") or "default").strip()
                 username = msg.get("username") or msg.get("user") or client_id
@@ -61,101 +108,101 @@ async def handle_client(websocket):
                 # Remove from old room if switching
                 if current_room and current_room in ROOMS:
                     ROOMS[current_room].discard(websocket)
+                    if not ROOMS[current_room]:
+                        del ROOMS[current_room]
 
                 current_room = room_id
-                if room_id not in ROOMS:
-                    ROOMS[room_id] = set()
-                ROOMS[room_id].add(websocket)
+                ROOMS.setdefault(room_id, set()).add(websocket)
                 CLIENT_ROOM[websocket] = room_id
                 CLIENT_INFO[websocket] = {
                     "id": client_id,
                     "username": username,
-                    "platform": platform
+                    "platform": platform,
+                    # Learned from the first v2 packet this client sends.
+                    "sid": msg.get("sid"),
                 }
 
-                logger.info(f"{username} ({platform}) joined room [{room_id}]. Total in room: {len(ROOMS[room_id])}")
+                logger.info(f"{username} ({platform}) joined room [{room_id}]. "
+                            f"Total in room: {len(ROOMS[room_id])}")
 
-                # Notify self of success
                 await websocket.send(json.dumps({
                     "type": "room_joined",
                     "room_id": room_id,
                     "room": room_id,
                     "client_id": client_id,
-                    "peer_count": len(ROOMS[room_id])
+                    "peer_count": len(ROOMS[room_id]),
+                    # v2 extras. Clients treat these as optional.
+                    "your_sid": msg.get("sid"),
+                    "peers": peer_list(room_id, exclude=websocket),
                 }))
 
-                # Notify other peers in room
-                join_notification = json.dumps({
+                await fan_out(room_id, json.dumps({
                     "type": "peer_joined",
                     "client_id": client_id,
                     "username": username,
                     "user": username,
                     "platform": platform,
-                    "peer_count": len(ROOMS[room_id])
+                    "peer_count": len(ROOMS[room_id]),
+                }), exclude=websocket)
+                continue
+
+            # 2. Everything else is peer traffic — forward it verbatim.
+            if msg_type in LOCAL_TYPES:
+                continue
+
+            # A client that starts sending before joining (or after a relay restart)
+            # is admitted using the room named in the packet.
+            if not current_room or current_room not in ROOMS:
+                req_room = str(msg.get("room") or msg.get("room_id") or "").strip()
+                if not req_room:
+                    continue
+                current_room = req_room
+                ROOMS.setdefault(current_room, set()).add(websocket)
+                CLIENT_ROOM[websocket] = current_room
+                CLIENT_INFO.setdefault(websocket, {
+                    "id": client_id, "username": client_id, "platform": "unknown", "sid": None,
                 })
-                for peer in list(ROOMS[room_id]):
-                    if peer != websocket:
-                        try:
-                            await peer.send(join_notification)
-                        except Exception:
-                            pass
 
-            # 2. Sync Actions (play, pause, seek, rate, chat, file_info, action)
-            elif msg_type in ("play", "pause", "seek", "rate", "chat", "file_info", "heartbeat", "action"):
-                # If current_room wasn't set by join, check message payload
-                if not current_room or current_room not in ROOMS:
-                    req_room = str(msg.get("room") or msg.get("room_id") or "").strip()
-                    if req_room:
-                        current_room = req_room
-                        if current_room not in ROOMS:
-                            ROOMS[current_room] = set()
-                        ROOMS[current_room].add(websocket)
-                        CLIENT_ROOM[websocket] = current_room
-                    else:
-                        continue
+            info = CLIENT_INFO.get(websocket, {})
 
-                # Attach sender metadata
-                sender_info = CLIENT_INFO.get(websocket, {})
-                msg["sender_id"] = client_id
-                msg["sender_name"] = sender_info.get("username", client_id)
-                msg["platform"] = sender_info.get("platform", "unknown")
+            # Remember the client's self-declared sid so `peer_left` can name it.
+            sid = msg.get("sid")
+            if sid and info.get("sid") != sid:
+                info["sid"] = sid
 
-                payload = json.dumps(msg)
-                # Broadcast to all other peers in the same room
-                for peer in list(ROOMS[current_room]):
-                    if peer != websocket:
-                        try:
-                            await peer.send(payload)
-                        except Exception:
-                            pass
+            # Stamp sender metadata. Note these OVERWRITE whatever the client sent —
+            # which is exactly why v2 identity lives in `sid` / `sname` / `splat`.
+            msg["sender_id"] = client_id
+            msg["sender_name"] = info.get("username", client_id)
+            msg["platform"] = info.get("platform", "unknown")
+
+            await fan_out(current_room, json.dumps(msg), exclude=websocket)
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"Connection closed for {client_id}")
     finally:
-        # Cleanup disconnected client
+        info = CLIENT_INFO.pop(websocket, {})
+        CLIENT_ROOM.pop(websocket, None)
+
         if current_room and current_room in ROOMS:
             ROOMS[current_room].discard(websocket)
-            leave_msg = json.dumps({
+            await fan_out(current_room, json.dumps({
                 "type": "peer_left",
                 "client_id": client_id,
-                "peer_count": len(ROOMS[current_room])
-            })
-            for peer in list(ROOMS[current_room]):
-                try:
-                    await peer.send(leave_msg)
-                except Exception:
-                    pass
+                # v2 extra: lets clients drop the right peer without the relayId map.
+                "sid": info.get("sid"),
+                "peer_count": len(ROOMS[current_room]),
+            }))
             if not ROOMS[current_room]:
                 del ROOMS[current_room]
 
-        CLIENT_ROOM.pop(websocket, None)
-        CLIENT_INFO.pop(websocket, None)
 
 async def main(host="0.0.0.0", port=8765):
     logger.info(f"Starting Ultimate Watch Together Relay Server on {host}:{port}")
     async with websockets.serve(handle_client, host, port):
         logger.info("Server is listening. Ready for PotPlayer, mpvEx, and Web clients!")
-        await asyncio.Future() # keep running
+        await asyncio.Future()  # keep running
+
 
 if __name__ == "__main__":
     port = 8765

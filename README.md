@@ -18,7 +18,7 @@ Traditional co-watching websites require uploading video files to central cloud 
 
 **Ultimate Watch Together** solves this by separating **Media Decoding** from **Playback Synchronization**:
 1. **Pristine Local Playback**: Each device plays the local video file (`.mkv`, `.mp4`) directly from device storage (SSD or phone internal memory).
-2. **Universal Sync Protocol**: A lightweight WebRTC / WebSocket message layer coordinates `Play`, `Pause`, `Seek`, and `Chat` across devices in $<50\text{ms}$ lockstep!
+2. **Universal Sync Protocol**: A lightweight WebSocket relay coordinates absolute playback state and chat across every device. Sub-second alignment, self-repairing after any dropped packet — see [PROTOCOL.md](PROTOCOL.md).
 
 ---
 
@@ -74,6 +74,15 @@ Connect with a clean, 3-digit pin code (e.g. `582`). Everyone in the room stays 
 
 ### 4. Real-time In-App Live Chat
 Send and receive chat messages in real time across PotPlayer, mpvEx, and Web browsers.
+On Android the chat is available **inside the player** as a collapsible bubble with an
+unread badge, so you never have to leave playback to talk.
+
+### 5. Self-Repairing Sync
+Sync is **state based**, not event based: clients exchange absolute position + paused +
+rate rather than "play"/"pause" commands, and the elected room leader re-broadcasts
+state every 3 seconds. A dropped, late or duplicated packet therefore cannot leave the
+room out of step — the next state simply overwrites it. Full details in
+[PROTOCOL.md](PROTOCOL.md).
 
 ---
 
@@ -86,22 +95,32 @@ python -m http.server 8080
 # Open http://localhost:8080 in your browser
 ```
 
+Or just use the hosted PWA — no install required.
+
 ### 2. Running the PotPlayer Synchronizer (Windows)
+The cloud relay is built in, so there is nothing to host and no IP address to type:
 ```powershell
 cd potplayer
 pip install -r requirements.txt
-# Start the relay server:
-python relay_server.py
-# In a new terminal, start PotPlayer sync:
 python potplayer_sync.py
 ```
+Open Daum PotPlayer, load your video, then Create or Join a 3-digit room.
+
+> `relay_server.py` is only needed if you want to run your **own** relay instead of the
+> bundled cloud one (`python relay_server.py`).
 
 ### 3. Building the mpvEx Android App
 ```bash
 cd mpvEx
-./gradlew assembleDebug
-# Installs app-debug.apk on your Android phone
+./gradlew assembleStandardDebug
 ```
+The APKs land in `mpvEx/app/build/outputs/apk/standard/debug/` — debug-signed, so they
+install directly with no keystore. Grab `app-standard-universal-debug.apk` if you are
+unsure which ABI your phone uses, or `app-standard-arm64-v8a-debug.apk` for any modern
+device.
+
+> If Gradle reports *"SDK location not found"* even though `local.properties` looks
+> right, the file has a UTF-8 BOM — re-save it without one.
 
 ---
 

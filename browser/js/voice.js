@@ -13,6 +13,7 @@ class VoiceEngine {
     this.audioContext = null;
     this.analyser = null;
     this.visualizerInterval = null;
+    this._listenerPeer = null;
 
     // Callbacks
     this.onSpeaking = null; // (isSpeaking: boolean) => void
@@ -20,10 +21,13 @@ class VoiceEngine {
   }
 
   /**
-   * Initialize incoming call listener
+   * Initialize incoming call listener.
+   * Safe to call repeatedly; the listener is attached once per Peer instance.
    */
   initCallListener() {
     if (!this.sync || !this.sync.peer) return;
+    if (this._listenerPeer === this.sync.peer) return;
+    this._listenerPeer = this.sync.peer;
 
     this.sync.peer.on('call', (call) => {
       console.log(`[Voice] Incoming voice call from ${call.peer}`);
@@ -55,13 +59,19 @@ class VoiceEngine {
       this.isInCall = true;
       this.isMuted = false;
       this._setupAudioAnalyser(this.localStream);
+      this.initCallListener();
 
-      // Call all connected data peers
-      if (this.sync && this.sync.connections) {
-        for (const conn of this.sync.connections) {
-          console.log(`[Voice] Calling peer: ${conn.peer}`);
-          const call = this.sync.peer.call(conn.peer, this.localStream);
-          this._handleCallStream(call);
+      // Voice peer ids are announced over the sync relay (`hello` packets),
+      // so there is no WebRTC data mesh to walk.
+      if (this.sync && this.sync.peer && this.sync.getVoicePeerIds) {
+        const targets = this.sync.getVoicePeerIds();
+        if (targets.length === 0) {
+          console.log('[Voice] No peers with voice support in the room yet.');
+        }
+        for (const voiceId of targets) {
+          console.log(`[Voice] Calling peer: ${voiceId}`);
+          const call = this.sync.peer.call(voiceId, this.localStream);
+          if (call) this._handleCallStream(call);
         }
       }
 

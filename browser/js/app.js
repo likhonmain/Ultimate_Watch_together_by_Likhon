@@ -268,8 +268,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   async function performJoinRoom(code, btnElement) {
     code = String(code || '').trim();
-    if (!code) {
-      showToast('Please enter the 3-digit room code.', false);
+    // Room codes are always 3 digits, on every platform.
+    if (!/^\d{3}$/.test(code)) {
+      showToast('Please enter the 3-digit room code (100-999).', false);
       return;
     }
     if (btnElement) {
@@ -285,7 +286,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateStartButtonState();
     } catch (err) {
       console.error('Join room error:', err);
-      showToast('Could not join room. Make sure Host created the room first.', false);
+      showToast('Could not reach the sync relay. Check your internet connection and try again.', false);
     } finally {
       if (btnElement) {
         btnElement.innerText = 'Join';
@@ -325,10 +326,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // Auto-join from URL parameter (?room=xyz)
+  // Auto-join from URL parameter (?room=524)
   const urlParams = new URLSearchParams(window.location.search);
-  const autoRoom = urlParams.get('room');
-  if (autoRoom) {
+  const autoRoom = (urlParams.get('room') || '').trim();
+  if (/^\d{3}$/.test(autoRoom)) {
     console.log(`[App] Auto-joining room from URL: ${autoRoom}`);
     if (inputRoomCode) inputRoomCode.value = autoRoom;
     if (desktopJoinInput) desktopJoinInput.value = autoRoom;
@@ -339,7 +340,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateStartButtonState();
     }).catch(e => {
       console.error('Auto-join error:', e);
-      showToast('Could not connect to host. Make sure host is online.', false);
+      showToast('Could not reach the sync relay. Check your internet connection.', false);
     });
   }
 
@@ -411,11 +412,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     stripBtnReconnect.addEventListener('click', () => {
       if (sync.roomId) {
         showToast(`Reconnecting to ${sync.roomId}...`, true, 3000);
-        if (sync.isHost) {
-          sync.init(sync.roomId);
-        } else {
-          sync.joinRoom(sync.roomId);
-        }
+        sync.reconnect().catch(e => {
+          console.error('Reconnect error:', e);
+          showToast('Could not reach the sync relay.', false);
+        });
       }
     });
   }
@@ -458,7 +458,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const mpStartDesc = document.getElementById('mp-start-desc');
 
   function updateStartButtonState() {
-    const isPeerConnected = (sync.connections && sync.connections.length > 0) || (sync.cloudPeerCount > 1);
+    const isPeerConnected = sync.getRemotePeerCount() > 0;
     const isReady = mediaLoaded && isPeerConnected;
 
     startButtons.forEach(btn => {
@@ -497,16 +497,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       showToast('Please select a movie file first.', false);
       return;
     }
-    const isPeerConnected = (sync.connections && sync.connections.length > 0) || (sync.cloudPeerCount > 1);
+    const isPeerConnected = sync.getRemotePeerCount() > 0;
     if (!isPeerConnected) {
       showToast('Waiting for friend to join your room first.', false);
       return;
     }
 
-    // Send sync action to peer (broadcasts to WebRTC and Cloud Relay)
-    sync.sendAction('start_watching', 0);
-
-    // Play locally from beginning
+    // Announce the absolute target state first, then mute our own echo so the
+    // local play/seeked events this triggers are not re-broadcast.
+    player.lastLocalActionAt = Date.now();
+    sync.sendStartWatching();
+    sync.mute(1200);
     player.video.currentTime = 0;
     player.video.play().catch(e => console.warn('Play error:', e));
 
@@ -768,12 +769,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   initAudioDubControls();
 
-  sync.onPeerConnected = (peerId) => {
-    console.log('[App] Peer connected:', peerId);
-    showToast('🎉 Friend has joined your room! Play/pause/seek are now in sync.', true, 5000);
+  sync.onPeerConnected = (sid, peer) => {
+    const who = (peer && peer.username) || 'Friend';
+    console.log('[App] Peer connected:', sid, who);
+    showToast(`🎉 ${who} joined your room! Play/pause/seek are now in sync.`, true, 5000);
     chat.playNotificationSound();
     chat.appendMessage({
-      text: 'Friend has joined the room! Synchronized playback is active.',
+      text: `${who} joined the room! Synchronized playback is active.`,
       sender: 'System',
       timestamp: Date.now(),
       isMe: false
@@ -781,15 +783,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateStartButtonState();
   };
 
-  sync.onPeerDisconnected = (peerId) => {
-    console.log('[App] Peer disconnected:', peerId);
-    showToast('⚠️ Friend disconnected from room.', false, 4000);
+  sync.onPeerDisconnected = (sid, peer) => {
+    const who = (peer && peer.username) || 'Friend';
+    console.log('[App] Peer disconnected:', sid, who);
+    showToast(`⚠️ ${who} left the room.`, false, 4000);
     chat.appendMessage({
-      text: 'Friend disconnected from the room.',
+      text: `${who} disconnected from the room.`,
       sender: 'System',
       timestamp: Date.now(),
       isMe: false
     });
+    updateStartButtonState();
+  };
+
+  sync.onPeerCountChanged = () => {
     updateStartButtonState();
   };
 

@@ -85,6 +85,10 @@ class VideoPlayer {
     this.lastTapTimeRight = 0;
     this.hasMediaLoaded = false;
 
+    // Sync bookkeeping (protocol v2 — see PROTOCOL.md)
+    this.lastLocalActionAt = 0;
+    this.pendingSeekTimer = null;
+
     this.init();
   }
 
@@ -242,7 +246,8 @@ class VideoPlayer {
         this.externalAudio.play().catch(e => console.warn(e));
       }
       if (this.sync && !this.sync.isRemoteUpdate) {
-        this.sync.sendPlay(this.video.currentTime, this.video.playbackRate);
+        this.lastLocalActionAt = Date.now();
+        this.sync.sendState('play');
       }
     });
 
@@ -259,7 +264,8 @@ class VideoPlayer {
       clearTimeout(this.hideControlsTimeout);
 
       if (this.sync && !this.sync.isRemoteUpdate) {
-        this.sync.sendPause(this.video.currentTime);
+        this.lastLocalActionAt = Date.now();
+        this.sync.sendState('pause');
       }
     });
 
@@ -267,14 +273,21 @@ class VideoPlayer {
       if (this.externalAudioFile && this.externalAudio) {
         this.externalAudio.currentTime = Math.max(0, this.video.currentTime + (this.dubOffsetMs / 1000));
       }
-      if (this.sync && !this.sync.isRemoteUpdate) {
-        this.sync.sendSeek(this.video.currentTime);
-      }
+      // Deliberately silent: a drag fires `seeking` dozens of times. The
+      // broadcast happens once on `seeked`, when the playhead has settled.
     });
 
     this.video.addEventListener('seeked', () => {
       if (this.externalAudioFile && this.externalAudio) {
         this.externalAudio.currentTime = Math.max(0, this.video.currentTime + (this.dubOffsetMs / 1000));
+      }
+      if (this.sync && !this.sync.isRemoteUpdate) {
+        this.lastLocalActionAt = Date.now();
+        // Coalesce: keyboard/gesture seeks arrive in bursts.
+        clearTimeout(this.pendingSeekTimer);
+        this.pendingSeekTimer = setTimeout(() => {
+          if (this.sync && !this.sync.isRemoteUpdate) this.sync.sendState('seek');
+        }, 120);
       }
     });
 
@@ -284,7 +297,8 @@ class VideoPlayer {
         this.externalAudio.playbackRate = this.video.playbackRate;
       }
       if (this.sync && !this.sync.isRemoteUpdate) {
-        this.sync.sendRate(this.video.playbackRate);
+        this.lastLocalActionAt = Date.now();
+        this.sync.sendState('rate');
       }
     });
 
@@ -433,6 +447,7 @@ class VideoPlayer {
       const targetTime = pos * this.video.duration;
 
       if (!isNaN(targetTime)) {
+        this.lastLocalActionAt = Date.now();
         this.video.currentTime = targetTime;
         this._updateProgress();
       }
@@ -737,73 +752,108 @@ class VideoPlayer {
   }
 
   /* ------------------------------------------------------------------------
-     Sync Engine Event Handlers
+     Sync Engine Event Handlers (protocol v2 — see PROTOCOL.md)
      ------------------------------------------------------------------------ */
   _bindSyncEvents() {
     if (!this.sync) return;
 
-    this.sync.onActionReceived = (action) => {
-      switch (action.type) {
-        case 'start_watching':
-          this.video.currentTime = action.time || 0;
-          this.video.play().catch(e => console.warn('Autoplay blocked:', e));
-          this._showGestureAnimation('🎬 Started Watching Together!');
-          this._hideCenterPlayCard();
-          if (window.showToast) window.showToast('🎬 Friend started watching together!', true, 4000);
-          break;
+    // The engine never touches the <video> element; it asks for state here.
+    this.sync.getLocalState = () => ({
+      position: this.video.currentTime || 0,
+      paused: !!this.video.paused,
+      rate: this.video.playbackRate || 1.0,
+      duration: (isFinite(this.video.duration) && this.video.duration > 0) ? this.video.duration : 0,
+      ready: this.hasMediaLoaded && this.video.readyState >= 1
+    });
 
-        case 'play':
-          this.video.currentTime = action.time;
-          if (action.rate) this.video.playbackRate = action.rate;
-          this.video.play().catch(e => console.warn('Autoplay blocked:', e));
-          this._showGestureAnimation('Play (Synced)');
-          this._hideCenterPlayCard();
-          break;
+    this.sync.onRemoteState = (st) => this._applyRemoteState(st);
+  }
 
-        case 'pause':
-          this.video.currentTime = action.time;
-          this.video.pause();
-          this._showGestureAnimation('Pause (Synced)');
-          this._showCenterPlayCard();
-          break;
+  /**
+   * Apply an absolute playback state coming from a peer.
+   * `st.target` is already latency-compensated by the sync engine.
+   */
+  _applyRemoteState(st) {
+    if (!st) return;
+    const heartbeat = st.cause === 'heartbeat';
 
-        case 'seek':
-          this.video.currentTime = action.time;
-          this._showGestureAnimation(`Seek: ${this._formatTime(action.time)}`);
-          break;
+    // A periodic correction must never fight the local user.
+    if (heartbeat) {
+      if (this.sync.isRemoteUpdate) return;
+      if (Date.now() - this.lastLocalActionAt < 1500) return;
+      if (this.isDraggingTimeline) return;
+      if (!this.hasMediaLoaded || this.video.readyState < 2) return;
+      if (!(isFinite(this.video.duration) && this.video.duration > 0)) return;
+    }
 
-        case 'rate':
-          this.video.playbackRate = action.rate;
-          this._updateSpeedUI();
-          this._showGestureAnimation(`Speed: ${action.rate}x`);
-          break;
+    const tol = heartbeat ? 0.7 : 0.3;
+    const maxT = (isFinite(this.video.duration) && this.video.duration > 0)
+      ? this.video.duration : Number.MAX_SAFE_INTEGER;
+    const target = Math.max(0, Math.min(maxT, st.target));
+    const drift = this.video.currentTime - target;
 
-        case 'heartbeat':
-          const drift = Math.abs(this.video.currentTime - action.time);
-          if (drift > 0.6) {
-            console.log(`[Sync] Drift of ${drift.toFixed(2)}s detected. Adjusting to ${action.time.toFixed(2)}s`);
-            this.video.currentTime = action.time;
-          }
-          if (action.isPlaying && this.video.paused) {
-            this.video.play().catch(() => {});
-            this._hideCenterPlayCard();
-          } else if (!action.isPlaying && !this.video.paused) {
-            this.video.pause();
-            this._showCenterPlayCard();
-          }
-          if (action.rate && this.video.playbackRate !== action.rate) {
-            this.video.playbackRate = action.rate;
-            this._updateSpeedUI();
-          }
-          break;
+    // Hold the echo mute open for the whole apply, including the seek settle.
+    this.sync.mute(heartbeat ? 700 : 400);
+
+    if (st.rate && Math.abs(this.video.playbackRate - st.rate) > 0.01) {
+      this.video.playbackRate = st.rate;
+      this._updateSpeedUI();
+    }
+
+    if (Math.abs(drift) > tol) {
+      this.sync.mute(2500);
+      const onSettled = () => {
+        this.video.removeEventListener('seeked', onSettled);
+        this.sync.muteSettled(250);
+      };
+      this.video.addEventListener('seeked', onSettled, { once: true });
+      this.video.currentTime = target;
+      if (!heartbeat) {
+        console.log(`[Sync] ${st.cause} from ${st.sname}: ${drift.toFixed(2)}s off, jumping to ${target.toFixed(2)}s`);
+      } else {
+        console.log(`[Sync] drift ${drift.toFixed(2)}s corrected to ${target.toFixed(2)}s`);
       }
-    };
+    }
+
+    if (st.paused) {
+      if (!this.video.paused) this.video.pause();
+      this._showCenterPlayCard();
+    } else {
+      if (this.video.paused) {
+        this.video.play().catch((e) => {
+          console.warn('[Sync] Remote play blocked by autoplay policy:', e);
+          if (window.showToast) window.showToast('Tap the screen once to allow synced playback.', false, 5000);
+        });
+      }
+      this._hideCenterPlayCard();
+    }
+
+    // On-screen feedback for deliberate actions only — heartbeats stay silent.
+    switch (st.cause) {
+      case 'start':
+        this._showGestureAnimation('🎬 Started Watching Together!');
+        if (window.showToast) window.showToast(`🎬 ${st.sname} started watching together!`, true, 4000);
+        break;
+      case 'play':
+        this._showGestureAnimation('Play (Synced)');
+        break;
+      case 'pause':
+        this._showGestureAnimation('Pause (Synced)');
+        break;
+      case 'seek':
+        this._showGestureAnimation(`Seek: ${this._formatTime(target)}`);
+        break;
+      case 'rate':
+        this._showGestureAnimation(`Speed: ${st.rate}x`);
+        break;
+    }
   }
 
   /* ------------------------------------------------------------------------
      Player Core Actions
      ------------------------------------------------------------------------ */
   togglePlay() {
+    this.lastLocalActionAt = Date.now();
     if (this.video.paused) {
       this.video.play().then(() => {
         this._showGestureAnimation('Play');
@@ -820,11 +870,13 @@ class VideoPlayer {
 
   seekDelta(seconds) {
     if (!this.video.duration) return;
+    this.lastLocalActionAt = Date.now();
     this.video.currentTime = Math.max(0, Math.min(this.video.duration, this.video.currentTime + seconds));
     this._showGestureAnimation(`${seconds > 0 ? '+' : ''}${seconds}s`);
   }
 
   setPlaybackSpeed(speed) {
+    this.lastLocalActionAt = Date.now();
     this.video.playbackRate = speed;
     this._updateSpeedUI();
     this._showGestureAnimation(`${speed}x`);

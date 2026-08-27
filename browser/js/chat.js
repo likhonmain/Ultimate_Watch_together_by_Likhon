@@ -8,6 +8,8 @@ class ChatManager {
     this.sync = syncEngine;
     this.unreadCount = 0;
     this.nickname = 'Guest';
+    this._lastFingerprint = null;
+    this._lastFingerprintAt = 0;
 
     // DOM Elements
     this.mpStream = document.getElementById('mp-chat-stream');
@@ -120,6 +122,16 @@ class ChatManager {
 
   handleIncomingMessage(msg) {
     if (!msg || !msg.text) return;
+
+    // Second dedupe layer: the engine drops replays by sid:seq, this catches
+    // an identical body arriving twice within a second from any source.
+    const fingerprint = `${msg.sender || ''}|${msg.text}`;
+    const now = Date.now();
+    if (this._lastFingerprint === fingerprint && now - this._lastFingerprintAt < 1000) {
+      return;
+    }
+    this._lastFingerprint = fingerprint;
+    this._lastFingerprintAt = now;
 
     this.appendMessage({
       text: msg.text,
