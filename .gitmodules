@@ -1,0 +1,3 @@
+[submodule "mpvEx"]
+	path = mpvEx
+	url = https://github.com/likhonmain/mpvEx.git

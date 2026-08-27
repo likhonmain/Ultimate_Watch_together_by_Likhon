@@ -1,0 +1,22 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Android / Gradle
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# IDE & Config
+.idea/
+.vscode/
+*.local
+*.log
+
+# OS generated
+Thumbs.db
+Desktop.ini
+.DS_Store
